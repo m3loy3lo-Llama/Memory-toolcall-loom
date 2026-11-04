@@ -1,0 +1,20 @@
+{
+  "name": "gemma-multimodal-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Multimodal backend for Gemma 4 using llama-server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "ide": "node headless_ide/server.js",
+    "test": "node headless_ide/test_ide.js && node tests/test_distillation_and_hierarchy.js && node tests/test_context_checkpoint.js",
+    "test:ide": "node headless_ide/test_ide.js",
+    "test:memory": "node tests/test_distillation_and_hierarchy.js",
+    "test:checkpoint": "node tests/test_context_checkpoint.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "diff": "^9.0.0",
+    "express": "^4.18.2"
+  }
+}
