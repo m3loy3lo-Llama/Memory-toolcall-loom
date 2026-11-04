@@ -1,315 +1,222 @@
 import express from 'express';
 import cors from 'cors';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { modelManager } from './modelManager.js';
-import { runAgentLoop } from './agent.js';
-import { TOOL_DEFINITIONS, WORKSPACE_DIR, listAllFiles } from './tools.js';
-import { memoryManager } from './memoryManager.js';
-import { compactionManager } from './distillationEngine.js';
-import { runSubAgent } from './subAgent.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { vfs } from './vfs.js';
+import { getFileSymbols, findSymbolReferences } from './symbolParser.js';
+import { replaceAllInFile, applyDiffToFile, formatFile } from './manipulator.js';
+import { lintFileOrProject, buildProject, testProject } from './feedback.js';
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.HEADLESS_IDE_PORT || 3003;
 
-// Middleware
 app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json({ limit: '20mb' }));
+
+// Helper to extract path from wildcard or query
+function extractPath(req) {
+  return req.params.path || req.params[0] || req.query.path || '';
+}
 
 // ---------------------------------------------------------------------------
-// API Endpoints
+// 1. Navigation & Knowledge (GET)
 // ---------------------------------------------------------------------------
 
 /**
- * Health & Model Status
+ * GET /project/structure
+ * Returns JSON tree of the project with language types and sizes
  */
-app.get('/api/status', (req, res) => {
-  const status = modelManager.getStatus();
-  res.json({
-    status: status.isReady ? 'ready' : (status.isStarting ? 'starting' : 'stopped'),
-    model: status.model,
-    hasVision: status.hasVision,
-    workspaceDir: WORKSPACE_DIR,
-    tools: TOOL_DEFINITIONS.map(t => t.function.name),
-    ctxSize: status.ctxSize,
-    workingMemory: {
-      observations: memoryManager?.observations?.length || 0,
-      mutations: memoryManager?.mutations?.length || 0,
-      trajectories: (memoryManager?.trajectories?.length || memoryManager?.history?.length || 0)
-    }
-  });
-});
-
-/**
- * Tool Definitions
- */
-app.get('/api/tools', (req, res) => {
-  res.json({ tools: TOOL_DEFINITIONS });
-});
-
-/**
- * List Discoverable Models & Active Model
- */
-app.get('/api/models', async (req, res) => {
+app.get('/project/structure', async (req, res) => {
   try {
-    const models = await modelManager.listAvailableModels();
-    res.json({
-      success: true,
-      activeModel: modelManager.getStatus().model,
-      activeModelPath: modelManager.getStatus().modelPath,
-      models
-    });
+    const root = req.query.root || '.';
+    const depth = Number(req.query.depth) || 6;
+    const structure = await vfs.getProjectStructure(root, depth);
+    res.json({ success: true, structure });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
 /**
- * Hot-Swap Model at Runtime
+ * GET /file/:path/symbols
+ * Returns a list of all symbols in a file (functions, structs, macros, variables)
  */
-app.post('/api/models/switch', async (req, res) => {
+app.get(['/file/:path(*)/symbols', '/file/symbols'], async (req, res) => {
   try {
-    const { modelPath, mmprojPath, ctxSize, gpuLayers } = req.body;
-    if (!modelPath) {
-      return res.status(400).json({ success: false, error: 'modelPath is required' });
-    }
-    console.log(`🔄 Request to hot-swap model to: ${modelPath}`);
-    const status = await modelManager.switchModel({ modelPath, mmprojPath, ctxSize, gpuLayers });
-    res.json({ success: true, status });
+    const filePath = extractPath(req);
+    if (!filePath) return res.status(400).json({ success: false, error: 'Path is required.' });
+
+    const result = await getFileSymbols(filePath);
+    res.json({ success: true, ...result });
   } catch (err) {
-    console.error('❌ Failed to hot-swap model:', err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
 /**
- * Chat & Agent Execution
+ * GET /symbol/:path/:symbol_name/references
+ * Returns all locations where a specific symbol is used
  */
-app.post('/api/chat', async (req, res) => {
+app.get('/symbol/:path(*)/:symbol_name/references', async (req, res) => {
   try {
-    const { messages, temperature = 0.2, maxSteps = 30 } = req.body;
-
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: 'Messages array is required.' });
-    }
-
-    console.log(`💬 [/api/chat] Incoming request with ${messages.length} messages (maxSteps: ${maxSteps})`);
-
-    const assistantMessage = await runAgentLoop({
-      messages,
-      temperature,
-      maxSteps: Number(maxSteps) || 30
-    });
-
-    res.json({
-      success: true,
-      message: assistantMessage
-    });
+    const targetDir = req.params.path || '.';
+    const symbolName = req.params.symbol_name;
+    const references = await findSymbolReferences(symbolName, targetDir);
+    res.json({ success: true, ...references });
   } catch (err) {
-    console.error('❌ [/api/chat] Error executing agent loop:', err);
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error while processing agent request.'
-    });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
 /**
- * Clear / Reset Session
+ * GET /file/:path/context
+ * Returns a window of text around a specific line number
  */
-app.post('/api/clear', (req, res) => {
-  console.log('🧹 [/api/clear] Session reset requested.');
-  if (memoryManager && typeof memoryManager.clear === 'function') {
-    memoryManager.clear();
-  }
-  res.json({ success: true, message: 'Session and working memory reset successfully.' });
-});
-
-/**
- * Inspect Active Working Memory & Trainable Embeddings
- */
-app.get('/api/memory', (req, res) => {
-  res.json({
-    mutations: memoryManager?.mutations || [],
-    observations: memoryManager?.observations || [],
-    trajectoriesCount: (memoryManager?.trajectories?.length || memoryManager?.history?.length || 0),
-    journal: memoryManager?.getJournalMarkdown ? memoryManager.getJournalMarkdown() : (memoryManager?.getMemorySummary ? memoryManager.getMemorySummary() : '')
-  });
-});
-
-/**
- * Tiered Memory Status (Hot, Warm, Cold)
- */
-app.get('/api/memory/tiers', (req, res) => {
-  const tiers = compactionManager.getTiersStatus();
-  res.json({
-    success: true,
-    tiers: {
-      hot: {
-        liveMutations: memoryManager?.mutations?.length || 0,
-        liveObservations: memoryManager?.observations?.length || 0,
-        liveTrajectories: memoryManager?.trajectories?.length || 0
-      },
-      warm: {
-        activeBranch: tiers.activeBranch,
-        compactionsCount: tiers.warmCompactionsCount,
-        latestCompaction: compactionManager.compactions[0] || null
-      },
-      cold: {
-        branch: tiers.activeBranch,
-        trainSteps: tiers.coldTrainSteps,
-        heuristicsCount: tiers.heuristicsCount,
-        recentHeuristics: tiers.recentHeuristics
-      },
-      actionChains: {
-        activeChainLength: tiers.activeChainLength,
-        suggestedNext: compactionManager.actionChainTracker.suggestNextAction()
-      },
-      checkpoint: compactionManager.compactions[0] ? {
-        id: compactionManager.compactions[0].id,
-        timestamp: compactionManager.compactions[0].timestamp,
-        branch: compactionManager.compactions[0].branch,
-        milestone: compactionManager.compactions[0].milestone,
-        decisionPath: compactionManager.compactions[0].decisionPath,
-        heuristics: compactionManager.compactions[0].heuristics
-      } : null
-    }
-  });
-});
-
-/**
- * Get Latest Context Checkpoint
- */
-app.get('/api/memory/checkpoint', (req, res) => {
-  const latestComp = compactionManager.compactions[0] || null;
-  if (!latestComp) {
-    return res.json({ success: true, checkpoint: null });
-  }
-  res.json({
-    success: true,
-    checkpoint: {
-      id: latestComp.id,
-      timestamp: latestComp.timestamp,
-      branch: latestComp.branch,
-      milestone: latestComp.milestone,
-      decisionPath: latestComp.decisionPath,
-      heuristics: latestComp.heuristics,
-      filesModified: latestComp.filesModified,
-      handoverBrief: compactionManager.generateHandoverMarkdown(latestComp)
-    }
-  });
-});
-
-/**
- * Trigger Smart Compaction Manually
- */
-app.post('/api/memory/compact', async (req, res) => {
+app.get(['/file/:path(*)/context', '/file/context'], async (req, res) => {
   try {
-    const { reason, milestone, decisionPath, heuristics } = req.body;
-    console.log(`🧹 [/api/memory/compact] Compaction requested: ${milestone || reason}`);
-    const result = await compactionManager.compactContext({
-      reason,
-      milestone,
-      decisionPath,
-      heuristics,
-      memoryManager
-    });
+    const filePath = extractPath(req);
+    const line = Number(req.query.line) || 1;
+    const windowSize = Number(req.query.window) || 10;
+
+    const context = await vfs.getFileContext(filePath, line, windowSize);
+    res.json({ success: true, ...context });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /human/focus & POST /human/focus
+ * Returns or sets the active file and line range highlighted in UI
+ */
+app.get('/human/focus', (req, res) => {
+  res.json({ success: true, focus: vfs.getHumanFocus() });
+});
+
+app.post('/human/focus', (req, res) => {
+  const { file, startLine, endLine } = req.body;
+  if (!file) return res.status(400).json({ success: false, error: 'file is required.' });
+  const focus = vfs.setHumanFocus(file, startLine, endLine);
+  res.json({ success: true, focus });
+});
+
+// ---------------------------------------------------------------------------
+// 2. Manipulation (POST)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /file/:path/replace_all
+ * Performs a regex-based replacement across the entire file and returns unified diff
+ */
+app.post(['/file/:path(*)/replace_all', '/file/replace_all'], async (req, res) => {
+  try {
+    const filePath = extractPath(req);
+    const { regex, replacement, flags = 'g' } = req.body;
+
+    if (!regex || replacement === undefined) {
+      return res.status(400).json({ success: false, error: 'Parameters "regex" and "replacement" are required.' });
+    }
+
+    const result = await replaceAllInFile(filePath, regex, replacement, flags);
     res.json(result);
   } catch (err) {
-    console.error('❌ Compaction failed:', err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
 /**
- * List Contextual Memory Branches
+ * POST /file/:path/apply_diff
+ * Applies a standard Unified Diff to a file
  */
-app.get('/api/memory/branches', async (req, res) => {
+app.post(['/file/:path(*)/apply_diff', '/file/apply_diff'], async (req, res) => {
   try {
-    const branches = await compactionManager.listBranches();
-    res.json({
-      success: true,
-      activeBranch: compactionManager.activeBranch,
-      branches
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
+    const filePath = extractPath(req);
+    const { diff } = req.body;
 
-/**
- * Switch Contextual Memory Branch
- */
-app.post('/api/memory/branch', async (req, res) => {
-  try {
-    const { branch_name } = req.body;
-    if (!branch_name) {
-      return res.status(400).json({ error: 'branch_name is required' });
+    if (!diff) {
+      return res.status(400).json({ success: false, error: 'Parameter "diff" is required.' });
     }
-    const result = await compactionManager.switchBranch(branch_name);
+
+    const result = await applyDiffToFile(filePath, diff);
     res.json(result);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
 /**
- * Direct Sub-Agent Delegation Endpoint
+ * POST /file/:path/format
+ * Formats file (clang-format or standard whitespace normalization)
  */
-app.post('/api/agent/delegate', async (req, res) => {
+app.post(['/file/:path(*)/format', '/file/format'], async (req, res) => {
   try {
-    const { task, instructions, targetFiles, maxSteps } = req.body;
-    if (!task) {
-      return res.status(400).json({ error: 'task is required' });
-    }
-    console.log(`👷 [/api/agent/delegate] Delegating sub-agent task: "${task}"`);
-    const result = await runSubAgent({
-      task,
-      instructions,
-      targetFiles,
-      maxSteps: Number(maxSteps) || 10
-    });
-    res.json({ success: true, result });
+    const filePath = extractPath(req);
+    const result = await formatFile(filePath);
+    res.json(result);
   } catch (err) {
-    console.error('❌ Sub-agent delegation error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(400).json({ success: false, error: err.message });
   }
 });
 
 // ---------------------------------------------------------------------------
-// Server Startup
+// 3. Feedback & Execution (POST)
 // ---------------------------------------------------------------------------
 
-app.listen(PORT, async () => {
-  console.log(`\n======================================================`);
-  console.log(`🚀 Local AI Agent Server running at http://localhost:${PORT}`);
-  console.log(`📂 Workspace Root: ${WORKSPACE_DIR}`);
-  console.log(`🛠️ Active Native Tools: ${TOOL_DEFINITIONS.map(t => t.function.name).join(', ')}`);
-  console.log(`======================================================\n`);
-
-  // Eagerly trigger model background launch
+/**
+ * POST /project/lint
+ * Runs a linter / syntax check and returns structured errors/warnings
+ */
+app.post('/project/lint', async (req, res) => {
   try {
-    console.log('🔄 Initializing local foundation model in background...');
-    modelManager.start().catch(err => {
-      console.warn('⚠️ Model initialization deferred or encountered warning:', err.message);
-    });
-
-    // Warm load memory
-    console.log('🔥 Warming up memory with workspace files...');
-    listAllFiles().then(files => {
-      memoryManager.warmLoad(files, WORKSPACE_DIR).then(() => {
-        console.log(`✅ Memory warmed up with ${files.length} files.`);
-      }).catch(err => {
-        console.warn('⚠️ Non-fatal memory warmup warning:', err.message);
-      });
-    }).catch(err => {
-      console.warn('⚠️ Non-fatal list files warning:', err.message);
-    });
-  } catch (e) {
-    console.warn('⚠️ Background model start warning:', e.message);
+    const target = req.body.path || req.query.path || '.';
+    const result = await lintFileOrProject(target);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
   }
 });
+
+/**
+ * POST /project/build
+ * Triggers the build system (e.g., make) and returns stdout/stderr
+ */
+app.post('/project/build', async (req, res) => {
+  try {
+    const { directory = '.', command = 'make' } = req.body;
+    const result = await buildProject(directory, command);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /project/test
+ * Runs test suite and returns results
+ */
+app.post('/project/test', async (req, res) => {
+  try {
+    const { directory = '.', command = 'npm test' } = req.body;
+    const result = await testProject(directory, command);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Startup Helper
+// ---------------------------------------------------------------------------
+
+export function startHeadlessIDEServer(port = PORT) {
+  return app.listen(port, () => {
+    console.log(`\n⚡ Headless IDE microservice running at http://localhost:${port}`);
+    console.log(`📡 Endpoints: /project/structure, /file/:path/symbols, /symbol/:path/:name/references`);
+    console.log(`🛠️ Actions: /file/:path/apply_diff, /file/:path/replace_all, /project/lint, /project/build`);
+  });
+}
+
+// If executed directly: `node server.js`
+if (process.argv[1] && process.argv[1].endsWith('headless_ide/server.js')) {
+  startHeadlessIDEServer();
+}
+
+export default app;
